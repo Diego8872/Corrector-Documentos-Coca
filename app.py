@@ -50,7 +50,10 @@ OK, ERR, NA = "✔", "✘", "—"
 # ----------------------------------------------------------------------------
 # Esquemas de extracción (lo que se le pide a la IA)
 # ----------------------------------------------------------------------------
-NUM_NOTE = "Los números van como número JSON (sin separador de miles, punto decimal). Las fechas en formato YYYY-MM-DD (si es ambigua, asumir día/mes/año)."
+NUM_NOTE = ("IMPORTANTE: los pesos, cantidades e importes devolvelos como TEXTO exactamente como están impresos (ej. \"1 036,000\"), sin convertirlos. "
+            "Las fechas en formato YYYY-MM-DD (si es ambigua, asumir día/mes/año). "
+            "El texto del PDF puede venir con dos columnas intercaladas (ej. Proveedor/Cliente o Recipient/Customer) y los nombres pueden cortarse en dos renglones: "
+            "reconstruí el dato completo SOLO si la continuación está realmente en el texto; no completes ni corrijas nada que no esté escrito.")
 
 SCHEMAS = {
     "factura": {
@@ -68,11 +71,11 @@ SCHEMAS = {
             "comprador_cuit": "CUIT/tax id del comprador",
             "comprador_direccion": "dirección del comprador",
             "descripcion_producto": "descripción de TODOS los productos, concatenada en un solo texto",
-            "cantidad": "cantidad total (número)",
-            "peso_bruto_kg": "peso BRUTO total en kg si figura (número) o null",
-            "peso_neto_kg": "peso NETO total en kg si figura (número) o null",
-            "valor_total": "valor total de la factura (número)",
-            "codigo_item": "código de ítem del cliente (ej. 1003135) o null",
+            "cantidad": "cantidad total en la unidad de medida de la factura (ej. KG), tal cual impresa",
+            "peso_bruto_kg": "peso BRUTO total en kg si figura, tal cual impreso, o null",
+            "peso_neto_kg": "peso NETO total en kg si figura, tal cual impreso, o null",
+            "valor_total": "valor total de la factura, tal cual impreso",
+            "codigo_item": "código de ítem del CLIENTE: número de 6-8 dígitos que acompaña a \"Coca Cola spec.\" (ej. 1003135). NO es el código de artículo/abreviatura del proveedor (ej. 006062-0003). null si no figura",
             "contrato": "número de contrato si figura o null",
         },
     },
@@ -84,7 +87,7 @@ SCHEMAS = {
             "cliente_cuit": "CUIT/tax id del cliente",
             "po": "número de orden / PO",
             "descripcion_producto": "descripción de TODOS los productos, concatenada en un solo texto",
-            "peso_bruto_kg": "peso bruto TOTAL en kg (número)",
+            "peso_bruto_kg": "peso bruto TOTAL en kg (columna Total/Gross weight), tal cual impreso",
         },
     },
     "coa": {
@@ -103,8 +106,8 @@ SCHEMAS = {
             "importador_razon_social": "razón social del importador",
             "importador_direccion": "dirección del importador",
             "denominacion_mercaderias": "denominación de las mercaderías, concatenada",
-            "peso_o_cantidad": "peso o cantidad informado (número)",
-            "valor_fob": "valor FOB (número)",
+            "peso_o_cantidad": "peso o cantidad informado, tal cual impreso",
+            "valor_fob": "valor FOB, tal cual impreso",
             "declaracion_factura_numero": "número de factura mencionado en la declaración de origen",
             "declaracion_factura_fecha": "fecha de factura mencionada en la declaración de origen",
         },
@@ -116,7 +119,7 @@ SCHEMAS = {
             "consignee_razon_social": "campo CONSIGNED TO / consignee: razón social",
             "consignee_cuit": "CUIT/tax id que figura en el consignee",
             "consignee_direccion": "dirección que figura en el consignee",
-            "gross_weight_kg": "GROSS WEIGHT total en kg (número)",
+            "gross_weight_kg": "GROSS WEIGHT total en kg, tal cual impreso",
             "items": "LISTA (una entrada por cada factura mencionada en DESCRIPTION OF GOODS, incluida la hoja de continuación) de objetos con claves: numero_factura, po, codigo_item, descripcion (texto tal cual figura, sin corregir errores de tipeo)",
         },
     },
@@ -161,6 +164,47 @@ def parse_num(v):
         return float(s)
     except ValueError:
         return None
+
+
+def num_cands(v):
+    """Interpretaciones posibles de un número impreso (decimal primero, miles después)."""
+    if v is None or v == "":
+        return []
+    if isinstance(v, (int, float)):
+        return [float(v)]
+    s = re.sub(r"[^\d,.\-]", "", str(v))
+    if not s:
+        return []
+    try:
+        if "," in s and "." in s:
+            return [parse_num(s)]
+        sep = "," if "," in s else "." if "." in s else None
+        if sep is None:
+            return [float(s)]
+        if s.count(sep) > 1:
+            return [float(s.replace(sep, ""))]
+        dec = float(s.replace(sep, "."))
+        if re.search(r"\%s\d{3}$" % sep, s):
+            return [dec, float(s.replace(sep, ""))]
+        return [dec]
+    except ValueError:
+        return []
+
+
+def pick_num(v, ref=None):
+    c = num_cands(v)
+    if not c:
+        return None
+    if ref is not None:
+        r0 = parse_num(ref)
+        if r0 is not None:
+            c = c + [x / 1000 for x in c]  # por si la IA convirtió "1 036,000" como 1036000
+            return min(c, key=lambda x: abs(x - r0))
+    return c[0]
+
+
+def eq_num(a, b, **kw):
+    return any(num_equal(x, y, **kw) for x in num_cands(a) for y in num_cands(b))
 
 
 def parse_date(v):
@@ -278,11 +322,24 @@ def sin_factura(r, d, controles, hay_facturas, po=None):
         (r.na if not hay_facturas else lambda *a: r.err(a[0], a[1], "", "", a[2]))(d, c, motivo)
 
 
-def es_consignatario_ok(r, doc, nombre, cuit, direccion=None, exigir_dir=False):
-    nom = norm(nombre)
-    r.check(doc, "Razón social del consignatario/comprador", nombre, RAZON_SOCIAL, RAZON_CLAVE in nom,
+def razon_ok(nombre, texto=None, usar_texto=False):
+    """Razón social completa; en packing/factura (2 columnas) se acepta si todas las palabras están en el texto."""
+    if RAZON_CLAVE in norm(nombre):
+        return True
+    if usar_texto and texto:
+        tk = tokens(texto)
+        return all(w in tk for w in RAZON_CLAVE.split() if w not in STOP)
+    return False
+
+
+def cuit_ok(cuit, texto=None):
+    return digits(CUIT) in digits(cuit) or bool(texto and digits(CUIT) in digits(texto))
+
+
+def es_consignatario_ok(r, doc, nombre, cuit, direccion=None, exigir_dir=False, texto=None, usar_texto=False):
+    r.check(doc, "Razón social del consignatario/comprador", nombre, RAZON_SOCIAL, razon_ok(nombre, texto, usar_texto),
             "No figura SERVICIOS Y PRODUCTOS PARA BEBIDAS REFRESCANTES S.R.L (razón social incompleta o mal escrita)." if nombre else "No se encontró razón social.")
-    r.check(doc, "CUIT", cuit, CUIT, digits(CUIT) in digits(cuit),
+    r.check(doc, "CUIT", cuit, CUIT, cuit_ok(cuit, texto),
             "No figura el CUIT 30-67773730-8." if cuit else "No figura CUIT.")
     if exigir_dir:
         ok = any(d in norm(direccion) for d in DIRECCIONES_BL)
@@ -293,7 +350,7 @@ def es_consignatario_ok(r, doc, nombre, cuit, direccion=None, exigir_dir=False):
 def reglas_transporte_maritimo(r, bl, facs, packs):
     d = DOCS["transporte"] + " (BL)"
     es_consignatario_ok(r, d, bl.get("consignee_razon_social"), bl.get("consignee_cuit"),
-                        bl.get("consignee_direccion"), exigir_dir=True)
+                        bl.get("consignee_direccion"), exigir_dir=True, texto=bl.get("_texto"))
     items = bl.get("items") or []
     usados = set()
     for f in facs:
@@ -310,20 +367,23 @@ def reglas_transporte_maritimo(r, bl, facs, packs):
                 "No figura PO en el BL." if not x.get("po") else "La PO no coincide con la factura.")
         ok, mot = desc_check(x.get("descripcion"), f.get("descripcion_producto"))
         r.check(dd, "Descripción de la mercadería vs Factura", x.get("descripcion"), f.get("descripcion_producto"), ok, mot)
-        if x.get("codigo_item") and f.get("codigo_item"):
-            r.check(dd, "Código de ítem vs Factura (adicional)", x.get("codigo_item"), f.get("codigo_item"),
-                    alnum(x.get("codigo_item")) == alnum(f.get("codigo_item")), "El código de ítem no coincide con la factura.")
+        if x.get("codigo_item"):
+            cod = alnum(x.get("codigo_item"))
+            en_factura = (re.search(r"(?<![0-9A-Z])" + re.escape(cod) + r"(?![0-9A-Z])", re.sub(r"[^A-Z0-9]+", " ", norm(f.get("_texto"))))
+                          is not None) if f.get("_texto") else cod == alnum(f.get("codigo_item"))
+            r.check(dd, "Código de ítem vs Factura (adicional)", x.get("codigo_item"), f.get("codigo_item") or "(buscado en el texto de la factura)",
+                    en_factura, "El código de ítem del BL no figura en la factura (posible error de tipeo).")
     for i, x in enumerate(items):
         if i not in usados:
             r.na(d, f"Factura {x.get('numero_factura')} mencionada en el BL", "El BL menciona una factura que no está cargada.")
     # Peso
-    bl_kg = parse_num(bl.get("gross_weight_kg"))
+    bl_kg = pick_num(bl.get("gross_weight_kg"), sum(parse_num(pick_num(f.get("peso_bruto_kg"))) or 0 for f in facs) or None)
     if not packs:
         r.na(d, "Gross weight vs Packing List", "No verificable: falta el Packing List.")
     elif bl_kg is None:
         r.err(d, "Gross weight vs Packing List", "", "", "No se pudo leer el gross weight del BL. Revisar.")
     else:
-        suma = sum(parse_num(p.get("peso_bruto_kg")) or 0 for p in packs)
+        suma = sum(pick_num(p.get("peso_bruto_kg"), (buscar_factura(facs, po=p.get("po")) or {}).get("peso_bruto_kg") and pick_num(buscar_factura(facs, po=p.get("po")).get("peso_bruto_kg"))) or 0 for p in packs)
         sin_pack = [f.get("numero_factura") for f in facs if not any(id_match(p.get("po"), f.get("po")) for p in packs)]
         if sin_pack:
             r.na(d, "Gross weight vs Packing List", f"Parcial: faltan Packing de las facturas {', '.join(map(str, sin_pack))}. "
@@ -331,7 +391,7 @@ def reglas_transporte_maritimo(r, bl, facs, packs):
         else:
             r.check(d, "Gross weight vs Packing List", bl_kg, suma, num_equal(bl_kg, suma),
                     f"Los kilos no coinciden (BL {bl_kg:,.2f} vs suma de packings {suma:,.2f}).")
-    pesos = [parse_num(f.get("peso_bruto_kg")) for f in facs]
+    pesos = [pick_num(f.get("peso_bruto_kg")) for f in facs]
     if facs and all(p is not None for p in pesos) and bl_kg is not None:
         t = sum(pesos)
         r.check(d, "Gross weight vs suma de facturas (adicional)", bl_kg, t, num_equal(bl_kg, t),
@@ -358,15 +418,15 @@ def reglas_factura(r, f):
                            ("vendedor_razon_social", "Vendedor", "No detalla vendedor.")):
         r.check(d, ctrl, f.get(key), "Debe figurar", bool(str(f.get(key) or "").strip()), msg)
     r.check(d, "Comprador: razón social", f.get("comprador_razon_social"), RAZON_SOCIAL,
-            RAZON_CLAVE in norm(f.get("comprador_razon_social")),
+            razon_ok(f.get("comprador_razon_social"), f.get("_texto"), True),
             "El comprador no es SERVICIOS Y PRODUCTOS PARA BEBIDAS REFRESCANTES S.R.L (revisar ortografía).")
-    r.check(d, "Comprador: CUIT", f.get("comprador_cuit"), CUIT, digits(CUIT) in digits(f.get("comprador_cuit")),
+    r.check(d, "Comprador: CUIT", f.get("comprador_cuit"), CUIT, cuit_ok(f.get("comprador_cuit"), f.get("_texto")),
             "No figura el CUIT 30-67773730-8 del comprador.")
 
 
 def reglas_packing(r, p, fac, hay):
     d = lbl(DOCS["packing"], p.get("numero_packing") or p.get("po"))
-    es_consignatario_ok(r, d, p.get("cliente_razon_social"), p.get("cliente_cuit"))
+    es_consignatario_ok(r, d, p.get("cliente_razon_social"), p.get("cliente_cuit"), texto=p.get("_texto"), usar_texto=True)
     if fac is None:
         sin_factura(r, d, ["PO vs Factura", "Descripción vs Factura"], hay, p.get("po"))
         return
@@ -421,14 +481,14 @@ def reglas_certificado_naladisa(r, c, fac, hay):
             "La dirección del importador no coincide con la de la factura. Revisar.")
     ok, mot = desc_check(c.get("denominacion_mercaderias"), fac.get("descripcion_producto"))
     r.check(d, ctrls[4], c.get("denominacion_mercaderias"), fac.get("descripcion_producto"), ok, mot)
-    pc = parse_num(c.get("peso_o_cantidad"))
-    cands = [x for x in (parse_num(fac.get("cantidad")), parse_num(fac.get("peso_bruto_kg")), parse_num(fac.get("peso_neto_kg"))) if x is not None]
+    pc = pick_num(c.get("peso_o_cantidad"))
+    cands = [x for k in ("cantidad", "peso_bruto_kg", "peso_neto_kg") for x in num_cands(fac.get(k))]
     if pc is None or not cands:
         r.err(d, ctrls[5], c.get("peso_o_cantidad"), "", "No se pudo comparar peso/cantidad (dato ilegible o ausente). Revisar.")
     else:
-        r.check(d, ctrls[5], pc, " / ".join(str(x) for x in cands), any(num_equal(pc, x) for x in cands),
+        r.check(d, ctrls[5], pc, " / ".join(str(x) for x in cands), eq_num(c.get("peso_o_cantidad"), cands[0]) or any(eq_num(c.get("peso_o_cantidad"), x) for x in cands),
                 "El peso/cantidad no coincide con la factura.")
-    fob, tot = parse_num(c.get("valor_fob")), parse_num(fac.get("valor_total"))
+    fob, tot = pick_num(c.get("valor_fob")), pick_num(fac.get("valor_total"))
     if fob is None or tot is None:
         r.err(d, ctrls[6], c.get("valor_fob"), fac.get("valor_total"), "No se pudo comparar el valor FOB (dato ilegible o ausente). Revisar.")
     else:
@@ -628,6 +688,8 @@ def generar_excel(filas, extraidos, referencia, modo):
         lista = data if isinstance(data, list) else [data]
         for n, dato in enumerate(lista, 1):
             for k, v in (dato or {}).items():
+                if k.startswith("_"):
+                    continue
                 ws2.append([f"{DOCS[key]} #{n}", k, json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else show(v)])
     ws2.column_dimensions["A"].width, ws2.column_dimensions["B"].width, ws2.column_dimensions["C"].width = 26, 32, 90
     buf = io.BytesIO()
@@ -681,6 +743,7 @@ def main():
                         if len(texto) < 30:
                             raise ValueError("El PDF no tiene texto legible (¿escaneado?).")
                         datos, motor = llamar_ia(construir_prompt(SCHEMAS[skey]), texto)
+                        datos["_texto"] = texto
                         datos_doc.append(datos)
                         avisos.append(f"{DOCS[key]} ({arch.name}): leído con {motor}")
                     except Exception as e:
@@ -708,7 +771,8 @@ def main():
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with st.expander("Detalle de lectura"):
             st.write(avisos)
-            st.json({DOCS[k]: v for k, v in extraidos.items()})
+            st.json({DOCS[k]: [{a: b for a, b in d.items() if not a.startswith("_")} for d in (v if isinstance(v, list) else [v or {}])]
+                     for k, v in extraidos.items()})
 
 
 if not os.environ.get("CORRECTOR_TEST"):
