@@ -534,18 +534,49 @@ def parse_json(txt):
         raise
 
 
+GROQ_PREFERIDOS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "meta-llama/llama-4-scout-17b-16e-instruct",
+                   "openai/gpt-oss-20b", "qwen/qwen3-32b"]
+_MODELO_GROQ = {}
+
+
+def modelo_groq(cliente):
+    """Usa GROQ_MODEL (secret) si está; si no, elige el primer modelo preferido que la cuenta tenga disponible."""
+    if secreto("GROQ_MODEL"):
+        return secreto("GROQ_MODEL")
+    if "m" not in _MODELO_GROQ:
+        ids = [m.id for m in cliente.models.list().data]
+        elegido = next((m for m in GROQ_PREFERIDOS if m in ids), None)
+        if not elegido:
+            posibles = [i for i in ids if not any(x in i.lower() for x in ("whisper", "guard", "tts", "playai", "orpheus"))]
+            if not posibles:
+                raise RuntimeError(f"La cuenta de Groq no tiene modelos de texto disponibles: {ids}")
+            elegido = posibles[0]
+        _MODELO_GROQ["m"] = elegido
+    return _MODELO_GROQ["m"]
+
+
 def llamar_ia(system, texto):
     error_groq = None
     if secreto("GROQ_API_KEY"):
         try:
+            import time
             from groq import Groq
-            resp = Groq(api_key=secreto("GROQ_API_KEY")).chat.completions.create(
-                model="llama-3.3-70b-versatile", temperature=0,
-                response_format={"type": "json_object"},
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": f"TEXTO DEL DOCUMENTO:\n{texto}"}],
-            )
-            return parse_json(resp.choices[0].message.content), "Groq"
+            cliente = Groq(api_key=secreto("GROQ_API_KEY"))
+            for intento in range(3):
+                try:
+                    resp = cliente.chat.completions.create(
+                        model=modelo_groq(cliente), temperature=0,
+                        response_format={"type": "json_object"},
+                        messages=[{"role": "system", "content": system},
+                                  {"role": "user", "content": f"TEXTO DEL DOCUMENTO:\n{texto}"}],
+                    )
+                    return parse_json(resp.choices[0].message.content), f"Groq ({modelo_groq(cliente)})"
+                except Exception as e:
+                    if "429" in str(e) or "rate" in str(e).lower():
+                        time.sleep(20 * (intento + 1))
+                        continue
+                    raise
+            raise RuntimeError("Límite de uso de Groq (429) tras varios reintentos.")
         except Exception as e:
             error_groq = e
     if secreto("ANTHROPIC_API_KEY"):
@@ -555,7 +586,7 @@ def llamar_ia(system, texto):
             messages=[{"role": "user", "content": f"TEXTO DEL DOCUMENTO:\n{texto}\n\nRespondé solo con el JSON."}],
         )
         return parse_json(msg.content[0].text), "Anthropic"
-    raise RuntimeError(f"No hay IA disponible. Error Groq: {error_groq}" if error_groq else "Falta GROQ_API_KEY (o ANTHROPIC_API_KEY) en secrets.")
+    raise RuntimeError(f"Groq falló: {error_groq}" if error_groq else "Falta GROQ_API_KEY (o ANTHROPIC_API_KEY) en secrets.")
 
 
 # ----------------------------------------------------------------------------
