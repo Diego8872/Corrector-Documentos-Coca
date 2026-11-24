@@ -599,44 +599,48 @@ GROQ_PREFERIDOS = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "meta-llama
 _MODELO_GROQ = {}
 
 
-def modelo_groq(cliente):
-    """Usa GROQ_MODEL (secret) si está; si no, elige el primer modelo preferido que la cuenta tenga disponible."""
+def modelos_groq(cliente):
+    """Modelos a probar, en orden: GROQ_MODEL (secret) o los preferidos que la cuenta tenga disponibles."""
     if secreto("GROQ_MODEL"):
-        return secreto("GROQ_MODEL")
-    if "m" not in _MODELO_GROQ:
+        return [secreto("GROQ_MODEL")]
+    if "lista" not in _MODELO_GROQ:
         ids = [m.id for m in cliente.models.list().data]
-        elegido = next((m for m in GROQ_PREFERIDOS if m in ids), None)
-        if not elegido:
-            posibles = [i for i in ids if not any(x in i.lower() for x in ("whisper", "guard", "tts", "playai", "orpheus"))]
-            if not posibles:
-                raise RuntimeError(f"La cuenta de Groq no tiene modelos de texto disponibles: {ids}")
-            elegido = posibles[0]
-        _MODELO_GROQ["m"] = elegido
-    return _MODELO_GROQ["m"]
+        lista = [m for m in GROQ_PREFERIDOS if m in ids]
+        extra = [i for i in ids if i not in lista and not any(x in i.lower() for x in ("whisper", "guard", "tts", "playai", "orpheus", "compound"))]
+        lista += extra[:2]
+        if not lista:
+            raise RuntimeError(f"La cuenta de Groq no tiene modelos de texto disponibles: {ids}")
+        _MODELO_GROQ["lista"] = lista
+    return _MODELO_GROQ["lista"]
+
+
+def es_temporal(e):
+    t = str(e).lower()
+    return any(x in t for x in ("429", "503", "502", "500", "over capacity", "rate limit", "overloaded", "timeout"))
 
 
 def llamar_ia(system, texto):
     error_groq = None
     if secreto("GROQ_API_KEY"):
+        import time
+        from groq import Groq
         try:
-            import time
-            from groq import Groq
             cliente = Groq(api_key=secreto("GROQ_API_KEY"))
-            for intento in range(3):
-                try:
-                    resp = cliente.chat.completions.create(
-                        model=modelo_groq(cliente), temperature=0,
-                        response_format={"type": "json_object"},
-                        messages=[{"role": "system", "content": system},
-                                  {"role": "user", "content": f"TEXTO DEL DOCUMENTO:\n{texto}"}],
-                    )
-                    return parse_json(resp.choices[0].message.content), f"Groq ({modelo_groq(cliente)})"
-                except Exception as e:
-                    if "429" in str(e) or "rate" in str(e).lower():
-                        time.sleep(20 * (intento + 1))
-                        continue
-                    raise
-            raise RuntimeError("Límite de uso de Groq (429) tras varios reintentos.")
+            for modelo in modelos_groq(cliente):
+                for intento in range(3):
+                    try:
+                        resp = cliente.chat.completions.create(
+                            model=modelo, temperature=0, response_format={"type": "json_object"},
+                            messages=[{"role": "system", "content": system},
+                                      {"role": "user", "content": f"TEXTO DEL DOCUMENTO:\n{texto}"}],
+                        )
+                        return parse_json(resp.choices[0].message.content), f"Groq ({modelo})"
+                    except Exception as e:
+                        error_groq = e
+                        if es_temporal(e) and intento < 2:
+                            time.sleep(5 * (intento + 1))
+                            continue
+                        break  # error no temporal o reintentos agotados: probar el siguiente modelo
         except Exception as e:
             error_groq = e
     if secreto("ANTHROPIC_API_KEY"):
@@ -726,7 +730,7 @@ def main():
         if not any(archivos.values()):
             st.error("Subí al menos un documento.")
             return
-        extraidos, avisos = {}, []
+        extraidos, avisos, fallidos = {}, [], []
         with st.spinner("Leyendo documentos..."):
             for key, subidos in archivos.items():
                 lista = subidos if isinstance(subidos, list) else ([subidos] if subidos else [])
@@ -748,8 +752,11 @@ def main():
                         avisos.append(f"{DOCS[key]} ({arch.name}): leído con {motor}")
                     except Exception as e:
                         st.error(f"No se pudo leer {arch.name}: {e}")
+                        fallidos.append({"Documento": f"{DOCS[key]}: {arch.name}", "Control": "Lectura del archivo", "En el documento": "",
+                                         "Esperado / Referencia": "", "Resultado": ERR,
+                                         "Motivo": f"NO SE PUDO LEER, volver a analizar. Los controles que dependen de este archivo pueden aparecer mal. ({str(e)[:120]})"})
                 extraidos[key] = (datos_doc[0] if datos_doc else None) if key == "transporte" else datos_doc
-        filas = ejecutar_controles(modo, extraidos)
+        filas = fallidos + ejecutar_controles(modo, extraidos)
         st.session_state["res"] = (filas, extraidos, referencia.strip(), modo, avisos)
 
     if "res" in st.session_state:
